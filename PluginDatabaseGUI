@@ -1,0 +1,533 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu May  9 22:52:56 2024
+
+@author: Carlo Schmitt 
+based on https://gist.github.com/Axel-Erfurt/ae983df9f65bef0b82a9a3a83a00014a
+based on https://python-forum.io/thread-37319-post-157729.html#pid157729
+based on https://www.pythonguis.com/faq/how-to-create-a-filter-search-bar-for-a-qtablewidget/
+"""
+
+from PyQt5 import QtSql, QtPrintSupport
+from PyQt5.QtGui import QTextDocument, QIcon, QTextCursor, QTextTableFormat
+from PyQt5.QtCore import QFileInfo, Qt, QSettings, QSize, QFile, QTextStream,QItemSelectionModel,  QSortFilterProxyModel, QModelIndex, QRegExp
+from PyQt5.QtSql import QSqlQuery
+from PyQt5.QtWidgets import (QMainWindow, QTableView, QDialog, QGridLayout, QPushButton, 
+                                                            QLineEdit, QWidget, QFileDialog, QComboBox, QMessageBox, QApplication)
+import sys
+import os
+###################################
+class PluginDBWindow(QMainWindow):
+    def __init__(self,additional_plugintypes=None):
+        #super(MyWindow, self).__init__()
+        QMainWindow.__init__(self)
+        self.setObjectName("PluginViewer")
+        root = QFileInfo(__file__).absolutePath()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.settings = QSettings('NN', self.objectName())
+        self.viewer = QTableView()
+        self.db = QtSql.QSqlDatabase.addDatabase('QSQLITE')
+        self.model = QtSql.QSqlTableModel()
+        self.delrow = -1
+        self.dbfile = ""
+        self.tablename = ""
+        self.headers = []
+        self.results = ""
+        self.mycolumn = 0
+        self.viewer.verticalHeader().setVisible(False)
+        self.setStyleSheet(stylesheet(self))        
+        self.viewer.setModel(self.model)
+        self.viewer.clicked.connect(self.findrow)
+        self.viewer.selectionModel().selectionChanged.connect(self.getCellText)
+         
+        self.dlg = QDialog()
+        self.layout = QGridLayout()
+        self.layout.addWidget(self.viewer,0, 0, 1, 5)#7)
+         
+        addBtn = QPushButton("insert row")
+        addBtn.setIcon(QIcon.fromTheme("add"))
+        addBtn.setFixedWidth(110)
+        addBtn.clicked.connect(self.addrow)
+        self.layout.addWidget(addBtn, 1, 0)
+         
+        delBtn = QPushButton("delete row")
+        delBtn.setIcon(QIcon.fromTheme("remove"))
+        delBtn.setFixedWidth(110)
+        delBtn.clicked.connect(self.deleteRow)
+        self.layout.addWidget(delBtn,1, 1)
+        
+        self.editor = QLineEdit()
+        self.editor.returnPressed.connect(self.editCell)
+        self.editor.setStatusTip("ENTER new value")
+        self.editor.setToolTip("ENTER new value")
+        self.layout.addWidget(self.editor,1, 2)
+ 
+        self.findfield = QLineEdit()
+        self.findfield.addAction(QIcon.fromTheme("edit-find"), 0)
+        self.findfield.returnPressed.connect(self.findCell)
+        self.findfield.setFixedWidth(200)
+        self.findfield.setPlaceholderText("find")
+        self.findfield.setStatusTip("ENTER to find")
+        self.findfield.setToolTip("ENTER to find")
+        self.layout.addWidget(self.findfield,1, 3)
+        
+   
+        filterBtn = QPushButton("filter")
+        filterBtn.setIcon(QIcon.fromTheme("remove"))
+        filterBtn.setFixedWidth(110)
+        filterBtn.clicked.connect(self.filterRows)
+        self.layout.addWidget(filterBtn,1, 4)
+        
+        """
+        addCBtn = QPushButton("insert column")
+        addCBtn.setIcon(QIcon.fromTheme("add"))
+        addCBtn.setFixedWidth(110)
+        addCBtn.clicked.connect(self.addCol)
+        self.layout.addWidget(addCBtn, 1,5)
+         
+        delCBtn = QPushButton("delete column")
+        delCBtn.setIcon(QIcon.fromTheme("remove"))
+        delCBtn.setFixedWidth(110)
+        delCBtn.clicked.connect(self.deleteCol)
+        self.layout.addWidget(delCBtn,1, 6)
+        """
+
+ 
+        self.myWidget = QWidget()
+        self.myWidget.setLayout(self.layout)
+ 
+        self.createToolbar()
+        self.statusBar().showMessage("Ready")
+        self.setCentralWidget(self.myWidget)
+        #self.setCentralWidget(self.myWidget2)
+        self.setWindowIcon(QIcon.fromTheme("office-database"))
+        self.setGeometry(20,20,600,450)
+        self.setWindowTitle("PluginViewer by DRCS-Carlo")
+        self.readSettings()
+        self.msg("Ready")
+        self.viewer.setFocus()
+        
+        # for database-creation and scanning
+        self.plugin_types=(".dll",".vst3",".clap")
+        if additional_plugintypes:
+            self.plugin_types+=additional_plugintypes
+        self.query = QSqlQuery()    
+        self.plugin_list=[]
+        # create a table
+        self.default_header_db="(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, company TEXT, type TEXT, subtype TEXT,path TEXT, plugintype TEXT, notes TEXT, Source TEXT, link TEXT)"
+        self.col_names=("id", "name", "company" ,"type","subtype","path", "plugintype", "notes")
+        self.name='PluginDB'
+        
+        ## Sorting
+        self.row_count=0
+        self.proxy_model = SortFilterProxyModel()
+        #self.setModel(self.proxyModel)
+        # This property holds whether the proxy model is dynamically sorted and filtered whenever the contents of the source model change
+        self.proxy_model.setDynamicSortFilter(True)        
+        self.proxy_model.setFilterKeyColumn(-1) # Search all columns.
+        self.proxy_model.setSourceModel(self.model)
+        self.proxy_model.sort(0, Qt.AscendingOrder)
+
+        self.viewer.setModel(self.proxy_model)
+ 
+    def createToolbar(self):
+        self.actionOpen = QPushButton("Open DB")
+        self.actionOpen.clicked.connect(self.fileOpen)
+        icon = QIcon.fromTheme("document-open")
+        self.actionOpen.setShortcut("Ctrl+O")
+        self.actionOpen.setShortcutEnabled(True)
+        self.actionOpen.setIcon(icon)
+        self.actionOpen.setObjectName("actionOpen")
+        self.actionOpen.setStatusTip("Open Database")
+        self.actionOpen.setToolTip("Open Database")
+        
+        self.actionCreate = QPushButton("Create DB")
+        self.actionCreate.clicked.connect(self.fileCreate)
+        icon = QIcon.fromTheme("document-open")
+        self.actionCreate.setIcon(icon)
+        self.actionCreate.setObjectName("actionCreate")
+        self.actionCreate.setStatusTip("Create Database")
+        self.actionCreate.setToolTip("Create Database")
+ 
+ 
+        self.actionScan = QPushButton("Scan Path")
+        self.actionScan.clicked.connect(self.scanPath)
+        icon = QIcon.fromTheme("document-open")
+        self.actionScan.setIcon(icon)
+        self.actionScan.setObjectName("actionScan")
+        self.actionScan.setStatusTip("Scan Path for Plugins")
+        self.actionScan.setToolTip("Scan Path for Plugins")
+ 
+        self.actionHide = QPushButton("")
+        self.actionHide.clicked.connect(self.toggleVerticalHeaders)
+        icon = QIcon.fromTheme("pane-hide-symbolic")
+        self.actionHide.setIcon(icon)
+        self.actionHide.setToolTip("toggle vertical Headers")
+        self.actionHide.setShortcut("F3")
+        self.actionHide.setShortcutEnabled(True)
+        self.actionHide.setStatusTip("toggle vertical Headers")
+ 
+        ### first row as headers
+        self.actionHeaders = QPushButton()
+        self.actionHeaders.clicked.connect(self.selectedRowToHeaders)
+        icon = QIcon.fromTheme("ok")
+        self.actionHeaders.setIcon(icon)
+        self.actionHeaders.setToolTip("selected row to headers")
+        self.actionHeaders.setShortcut("F5")
+        self.actionHeaders.setShortcutEnabled(True)
+        self.actionHeaders.setStatusTip("selected row to headers")
+
+        ###############################
+        self.tb = self.addToolBar("ToolBar")
+        self.tb.setIconSize(QSize(16, 16))
+        self.tb.setMovable(False)
+        self.tb.addWidget(self.actionOpen)
+        self.tb.addSeparator()
+        self.tb.addWidget(self.actionCreate)
+        self.tb.addSeparator()
+
+        self.tb.addWidget(self.actionScan)
+        self.tb.addSeparator()
+        ### sep
+        #self.tb.addSeparator()
+        #self.tb.addSeparator()
+        ### popupMenu
+        self.pop = QComboBox()
+        self.pop.setFixedWidth(200)
+        self.pop.currentIndexChanged.connect(self.setTableName)
+        self.tb.addWidget(self.pop)
+        self.tb.addSeparator()
+        self.tb.addWidget(self.actionHide)
+        self.addToolBar(self.tb)
+ 
+    def deleteRow(self):
+        row = self.viewer.currentIndex().row()
+        self.model.removeRow(row)
+        self.initializeModel()
+        self.viewer.selectRow(row)
+ 
+    def selectedRowToHeaders(self):
+        if self.model.rowCount() > 0:
+            headers = []
+            row = self.selectedRow()
+            for column in range(self.model.columnCount()):
+                headers.append(self.model.data(self.model.index(row, column)))
+                self.model.setHeaderData(column, Qt.Horizontal, headers[column], Qt.EditRole)
+            print(headers)
+ 
+    def findCell(self):
+        column = 0
+        ftext = self.findfield.text()
+        model = self.viewer.model()
+        if self.viewer.selectionModel().hasSelection():
+            row =  self.viewer.selectionModel().selectedIndexes()[0].row() 
+            row = row + 1
+        else:
+            row = 0
+        start = model.index(row, column)
+        matches = model.match(start, Qt.DisplayRole,ftext, 1, Qt.MatchContains)
+        if matches:
+            print("found", ftext, matches)
+            index = matches[0]
+            self.viewer.selectionModel().select(index, QItemSelectionModel.Select)
+        else:
+            column = column + 1
+            self.findNextCell(column)
+ 
+    def findNextCell(self, column):
+        self.viewer.clearSelection()
+        ftext = self.findfield.text()
+        model = self.viewer.model()
+        if self.viewer.selectionModel().hasSelection():
+            row =  self.viewer.selectionModel().selectedIndexes()[0].row()
+            row = row + 1
+        else:
+            row = 0
+        start = model.index(row, column)
+        matches = model.match(start, Qt.DisplayRole,ftext, 1, Qt.MatchContains)
+        if matches:
+            print("found", ftext)
+            index = matches[0]
+            self.viewer.selectionModel().select(index, QItemSelectionModel.Select)
+        else:
+            column = column + 1
+            self.findNextCell(column)
+ 
+    def toggleVerticalHeaders(self):
+        if self.viewer.verticalHeader().isVisible() == False:
+            self.viewer.verticalHeader().setVisible(True)
+        else:
+            self.viewer.verticalHeader().setVisible(False)
+ 
+    def fileOpen(self):
+        fileName, _ = QFileDialog.getOpenFileName(None, "Open Database File", "/home/Dokumente/DB", "DB (*.sqlite *.db *.sql3);; All Files (*.*)")   
+        if fileName:
+            data_split=fileName.split("/")
+            db_name=data_split[-1]
+            self.db_name=db_name
+            self.fileName_orig=fileName
+            self.fileOpenStartup(fileName)
+    
+    def scanPath(self):       
+        folderdir= QFileDialog.getExistingDirectory(None, "Select Directory","/home/Dokumente/DB")
+        if folderdir:
+            self.scan_and_add(folderdir)
+        
+    """         
+    def findInTable(self, text):      
+        for row in range(self.row_count):#self.NUMBER_OF_ROWS):
+            row_text = self.TableView.proxyModel.data(self.TableView.proxyModel.index(row, 0), 0)
+            if row_text:
+                if row_text.lower().startswith(text.lower()):
+                    print(self.TableView.proxyModel.data(self.TableView.proxyModel.index(row, 0), 0))
+                    self.TableView.showRow(row)
+                else:
+                    self.TableView.hideRow(row)
+    """
+ 
+    def countRows(self):
+        self.query.exec_("SELECT COUNT(*) FROM "+self.name)
+        row_count =self.query.size()
+        self.row_count=row_count 
+    
+    def filterRows(self):
+        column = 0
+        ftext =  self.findfield.text()
+        
+        self.proxy_model.setFilterFixedString(ftext)
+    """
+    def addCol(self):
+        pass
+    
+    def deleteCol(self):
+        col = self.viewer.currentIndex().column()
+        self.model.removeColumn(col)
+        self.initializeModel()
+        self.viewer.selectRow(col)
+    """
+    
+    
+    def fileCreate(self):        
+        db_name, _ = QFileDialog.getSaveFileName(None, "Create Database File", "/home/Dokumente/DB", "DB (*.db);; All Files (*.*)")     
+        if db_name:           
+            self.db_name=db_name            
+            self.db.setDatabaseName(db_name)
+            # try to open the database
+            if not self.db.open():
+                raise Error("Could not open the database")              
+            self.query.exec_("CREATE TABLE IF NOT EXISTS "+self.name+self.default_header_db)
+            print("Tables:", self.db.tables())
+            tablelist = self.db.tables()
+            self.fillComboBox(tablelist)
+            self.msg("please choose Table from the ComboBox")
+            self.countRows()
+            
+    def fileOpenStartup(self, fileName):
+        tablelist = []
+        if fileName:
+            self.db.close()
+            self.dbfile = fileName
+            self.db.setDatabaseName(self.dbfile)
+            self.db.open()
+            print("Tables:", self.db.tables())
+            tablelist = self.db.tables()
+            self.fillComboBox(tablelist)
+            self.msg("please choose Table from the ComboBox")
+            self.countRows()
+          
+    
+    def setAutoWidth(self):
+        self.viewer.resizeColumnsToContents()
+ 
+    def fillComboBox(self, tablelist):
+        self.pop.clear()
+        self.pop.insertItem(0, "choose Table ...")
+        self.pop.setCurrentIndex(0)
+        for row in tablelist:
+            self.pop.insertItem(self.pop.count(), row)
+        if self.pop.count() > 1:
+            self.pop.setCurrentIndex(1)
+            self.setTableName()
+ 
+    def getCellText(self):
+        if self.viewer.selectionModel().hasSelection():
+            item = self.viewer.selectedIndexes()[0]
+            if not item == None:
+                name = item.data()
+            else:
+                name = ""
+            self.editor.setText(str(name))
+        else:
+            self.editor.clear()
+ 
+    def editCell(self):
+        item = self.viewer.selectedIndexes()[0]
+        row = self.selectedRow()
+        column = self.selectedColumn()
+        self.model.setData(item, self.editor.text())
+ 
+    def setTableName(self):
+        if not self.pop.currentText() == "choose Table ...":
+            self.tablename = self.pop.currentText()
+            print("DB is:", self.dbfile)
+            self.msg("initialize")
+            self.initializeModel()
+ 
+    def initializeModel(self):
+        print("Table selected:", self.tablename)
+        self.model.setTable(self.tablename)
+        self.model.setEditStrategy(QtSql.QSqlTableModel.OnFieldChange)
+        self.model.select()
+        self.setAutoWidth()
+        self.msg(self.tablename + " loaded *** " + str(self.model.rowCount()) + " records")
+ 
+    def addrow(self):
+        row =  self.viewer.selectionModel().selectedIndexes()[0].row()
+        ret = self.model.insertRow(row)
+        if ret:
+            self.viewer.selectRow(row)
+            item = self.viewer.selectedIndexes()[0]
+            self.model.setData(item, str(row))
+            self.row_count+=1
+         
+    def findrow(self, i):
+        self.delrow = i.row()
+ 
+    def selectedRow(self):
+        if self.viewer.selectionModel().hasSelection():
+            row =  self.viewer.selectionModel().selectedIndexes()[0].row()
+            return int(row)
+ 
+    def selectedColumn(self):
+        column =  self.viewer.selectionModel().selectedIndexes()[0].column()
+        return int(column)
+ 
+    def closeEvent(self, e):
+        self.writeSettings()
+        e.accept()
+ 
+    def readSettings(self):
+        print("reading settings")
+        if self.settings.contains('geometry'):
+            self.setGeometry(self.settings.value('geometry'))
+ 
+    def writeSettings(self):
+        print("writing settings")
+        self.settings.setValue('geometry', self.geometry())
+ 
+    def msg(self, message):
+        self.statusBar().showMessage(message)
+ 
+    def show_all(self):
+        tablelist = self.db.tables()
+        self.fillComboBox(tablelist)
+
+    # Scan for plguins
+    def scan_and_add(self,folderdir):
+        self.scan_plugins(folderdir)
+        self.add_rows_from_list(self.plugin_list)
+        self.countRows()
+        self.show_all()
+    
+    def scan_plugins(self,folderdir):
+        for path, dirc, files in os.walk(folderdir):
+            for name in files:
+                if name.endswith(self.plugin_types):
+                    self.plugin_list+=[(path,name)]
+    
+    def add_rows_from_list(self,new_vals=[]):
+        for data in new_vals:
+            fullpath=os.path.join(data[0],data[1])
+            data_split=data[1].split(".")
+            plugin_name, plugin_type=data_split[0],data_split[-1]
+            new_vals="('"+plugin_name+"','"+fullpath+"','"+plugin_type+"')"
+            columns_to_add="(name,path,plugintype)"
+            add_statement="INSERT INTO "+self.name+columns_to_add+" VALUES "+new_vals
+            # check if plugin with path already included, if not add to db
+            check_statement="SELECT id FROM "+self.name+" WHERE path = '"+fullpath+"'"            
+            self.query.exec_(check_statement)
+            # add with dummy values for missing infomration 
+            if not self.query.first():             
+                self.query.exec_(add_statement)
+                
+                
+class SortFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self):
+        super().__init__()  
+    def filterAcceptsRow(self, sourceRow, sourceParent):
+        result = False
+        if self.filterKeyColumn() == 0: # only interested in the first column  
+            index = self.sourceModel().index(sourceRow, 0, sourceParent)
+            data = self.sourceModel().data(index)
+            # we could additionally filter here on the data
+            return True  
+        # Otherwise ignore
+        return super(SortFilterProxyModel, self).filterAcceptsRow(sourceRow, sourceParent)
+    
+def stylesheet(self):
+        return """
+        QTableView
+        {
+            border: 1px solid grey;
+            border-radius: 0px;
+            font-size: 8pt;
+            background-color: #CCDAE1;
+            selection-color: #92DDD9;
+        }
+        QTableView::item:hover
+        {   
+            color: black;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #92DDD9, stop:1 #CCDAE1);           
+        }
+         
+        QTableView::item:selected 
+        {
+            color: #F4F4F4;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #6169e1, stop:1 #3465a4);
+        } 
+ 
+        QStatusBar
+        {
+            font-size: 7pt;
+            color: #FF6E22;
+        }
+ 
+        QPushButton
+        {
+            font-size: 8pt;
+            icon-size: 16px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #83C37C, stop:1 #F9BC00);      
+        }
+                                        
+        QLineEdit
+        {
+            background-color: #CCDAE1;
+        }
+        
+        QPushButton:hover
+        {   
+            color: black;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #E21227, stop:1 #FF6E22);           
+            border: 1px solid #b7b7b7 inset;
+            border-radius: 3px;
+        }
+        QComboBox
+        {
+            font-size: 8pt;           
+        }
+        
+        QMainWindow
+        {
+            background-color: black;
+        }
+    """
+###################################     
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName('PluginDBView')
+    main = PluginDBWindow()
+    main.show()
+    if len(sys.argv) > 1:
+        print(sys.argv[1])
+        main.fileOpenStartup(sys.argv[1])
+    sys.exit(app.exec_())
